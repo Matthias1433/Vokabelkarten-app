@@ -1101,7 +1101,7 @@ function BrowseView({ folder, order: orderMode, onEdit, onDelete, onImageDrop })
   };
 
   return (
-    <div style={{ width: '100%', maxWidth: 680, display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+    <div style={{ width: '100%', maxWidth: 680, display: 'flex', flexDirection: 'column', gap: '1rem', alignSelf: 'flex-start', paddingBottom: '2rem' }}>
       {/* Suchfeld */}
       <div style={{ position: 'relative' }}>
         <input
