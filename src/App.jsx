@@ -4,7 +4,7 @@ import {
   Folder, FolderOpen, Plus, Pencil, Trash2, Shuffle, Download, BarChart3, Flame,
   Menu, X, Check, RotateCcw, ChevronLeft, ChevronRight, Upload, HardDrive,
   BookOpen, Brain, PencilLine, ChevronDown, Plug, FolderSync, Settings2, Volume2,
-  Maximize2, Minimize2
+  Maximize2, Minimize2, Filter
 } from 'lucide-react';
 import AuthScreen from './AuthScreen';
 
@@ -46,6 +46,10 @@ function mkCard(p = {}) {
     ease: typeof p.ease === 'number' ? p.ease : 2.5,
     interval: typeof p.interval === 'number' ? p.interval : 0,
     repetitions: typeof p.repetitions === 'number' ? p.repetitions : 0,
+    // FSRS-Zustand (null = noch nie bewertet → wird beim 1. Review initialisiert)
+    stability: typeof p.stability === 'number' ? p.stability : null,
+    difficulty: typeof p.difficulty === 'number' ? p.difficulty : null,
+    lastReview: p.lastReview || null,
     due: p.due || startOfDay().toISOString(),
     totalReviews: p.totalReviews || 0,
     correctReviews: p.correctReviews || 0,
@@ -64,38 +68,107 @@ function mkFolder(name, cards = []) {
   };
 }
 
-/* ---------- SM-2 ---------- */
-function applySM2(card, quality) {
-  let { ease = 2.5, interval = 0, repetitions = 0 } = card;
-  if (quality < 3) {
-    interval = 1;
-    repetitions = 0;
+/* ---------- FSRS (Free Spaced Repetition Scheduler, v5) ----------
+   Löst SM-2 ab. Zustand pro Karte: stability (S, „Gedächtnis-Haltbarkeit"
+   in Tagen) und difficulty (D, 1–10). Daraus + verstrichener Zeit ergibt
+   sich das nächste Intervall bei Ziel-Behaltensrate 90 %.
+   Bewertung G: 1 Nochmal · 2 Schwer · 3 Gut · 4 Leicht. */
+const FSRS_W = [
+  0.40255, 1.18385, 3.173, 15.69105, 7.1949, 0.5345, 1.4604, 0.0046,
+  1.54575, 0.1192, 1.01925, 1.9395, 0.11, 0.29605, 2.2698, 0.2315,
+  2.9898, 0.51655, 0.6621,
+];
+const FSRS_DECAY      = -0.5;
+const FSRS_FACTOR     = Math.pow(0.9, 1 / FSRS_DECAY) - 1;   // = 19/81
+const FSRS_RETENTION  = 0.9;                                  // Ziel-Behaltensrate
+const FSRS_MAX_IVL    = 36500;                                // 100 Jahre Deckel
+const clampD = (d) => Math.min(Math.max(d, 1), 10);
+
+// SM-2-Quality (1/2/4/5 aus RATINGS) → FSRS-Grade (1..4)
+const gradeFromQ = (q) => (q <= 1 ? 1 : q === 2 ? 2 : q >= 5 ? 4 : 3);
+
+const fsrsRetrievability = (t, S) => Math.pow(1 + FSRS_FACTOR * t / S, FSRS_DECAY);
+const fsrsInterval = (S) => {
+  const i = (S / FSRS_FACTOR) * (Math.pow(FSRS_RETENTION, 1 / FSRS_DECAY) - 1);
+  return Math.min(FSRS_MAX_IVL, Math.max(1, Math.round(i)));
+};
+const fsrsInitStability  = (G) => Math.max(FSRS_W[G - 1], 0.1);
+const fsrsInitDifficulty = (G) => clampD(FSRS_W[4] - Math.exp(FSRS_W[5] * (G - 1)) + 1);
+
+function fsrsNextDifficulty(D, G) {
+  const delta = D - FSRS_W[6] * (G - 3);
+  // Mittelwert-Rückkehr Richtung D0(Leicht)
+  return clampD(FSRS_W[7] * fsrsInitDifficulty(4) + (1 - FSRS_W[7]) * delta);
+}
+function fsrsStabilitySuccess(D, S, R, G) {
+  const hard = G === 2 ? FSRS_W[15] : 1;
+  const easy = G === 4 ? FSRS_W[16] : 1;
+  return S * (1 + Math.exp(FSRS_W[8]) * (11 - D) * Math.pow(S, -FSRS_W[9]) *
+    (Math.exp(FSRS_W[10] * (1 - R)) - 1) * hard * easy);
+}
+function fsrsStabilityFail(D, S, R) {
+  const after = FSRS_W[11] * Math.pow(D, -FSRS_W[12]) *
+    (Math.pow(S + 1, FSRS_W[13]) - 1) * Math.exp(FSRS_W[14] * (1 - R));
+  return Math.min(after, S);   // nach einem Lapse nie stabiler als vorher
+}
+// Mehrfach-Wiederholung am selben Tag (Kurzzeit-Stabilität)
+const fsrsShortTerm = (S, G) => S * Math.exp(FSRS_W[17] * (G - 3 + FSRS_W[18]));
+
+function applyFSRS(card, quality) {
+  const G   = gradeFromQ(quality);
+  const now = new Date();
+  let S, D;
+
+  if (!card.stability || !card.lastReview) {
+    // Allererste Bewertung dieser Karte
+    S = fsrsInitStability(G);
+    D = fsrsInitDifficulty(G);
   } else {
-    if (repetitions === 0) interval = 1;
-    else if (repetitions === 1) interval = 6;
-    else interval = Math.round(interval * ease);
-    repetitions += 1;
+    const elapsed = Math.max(0, (now - new Date(card.lastReview)) / MS_DAY);
+    D = fsrsNextDifficulty(card.difficulty || fsrsInitDifficulty(3), G);
+    if (elapsed < 1) {
+      S = fsrsShortTerm(card.stability, G);
+    } else {
+      const R = fsrsRetrievability(elapsed, card.stability);
+      S = G === 1
+        ? fsrsStabilityFail(D, card.stability, R)
+        : fsrsStabilitySuccess(D, card.stability, R, G);
+    }
   }
-  ease = ease + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02));
-  ease = Math.max(1.3, ease);
+
+  const interval = fsrsInterval(S);
   return {
     ...card,
-    ease,
+    stability: S,
+    difficulty: D,
     interval,
-    repetitions,
-    due: addDays(new Date(), interval).toISOString(),
+    repetitions: (card.repetitions || 0) + 1,
+    lastReview: now.toISOString(),
+    due: addDays(now, interval).toISOString(),
     totalReviews: (card.totalReviews || 0) + 1,
-    correctReviews: (card.correctReviews || 0) + (quality >= 3 ? 1 : 0),
+    // Nur „Nochmal" (G=1) gilt als Lapse; Schwer/Gut/Leicht sind erinnert.
+    correctReviews: (card.correctReviews || 0) + (G >= 2 ? 1 : 0),
   };
 }
 
-/* ---------- Klassifikation für Statistik ---------- */
+/* ---------- Schwierige Karten ----------
+   Karten, bei denen der Nutzer wiederholt scheitert oder die FSRS als
+   hartnäckig schwer einstuft. Braucht ein paar Wiederholungen als Basis. */
+function isHard(card) {
+  const t = card.totalReviews || 0;
+  if (t < 2) return false;
+  const rate = (card.correctReviews || 0) / t;
+  if (rate <= 0.6) return true;                 // ≤ 60 % erinnert
+  if ((card.difficulty || 0) >= 7.5) return true; // FSRS-Schwierigkeit hoch
+  return false;
+}
+
+/* ---------- Klassifikation für Statistik (FSRS-basiert) ---------- */
 function classify(card) {
-  const r = card.repetitions || 0;
-  if (r === 0) return 'neu';
-  if (r <= 2) return 'lernend';
-  if ((card.interval || 0) > 21) return 'beherrscht';
-  if ((card.ease || 0) > 2.0) return 'vertraut';
+  if ((card.repetitions || 0) === 0) return 'neu';
+  const iv = card.interval || 0;
+  if (iv >= 21) return 'beherrscht';
+  if (iv >= 7)  return 'vertraut';
   return 'lernend';
 }
 
@@ -165,6 +238,357 @@ function parseFile(name, text) {
 }
 
 /* =====================================================================
+   JSON-Import – flexibles Format
+   Akzeptiert:
+     • Array von Karten:           [{ term, def, … }, …]
+     • Objekt mit Karten:          { name?, cards: [...] }
+     • Array von Ordnern:          [{ name, cards: [...] }, …]
+     • Objekt mit Ordnern:         { folders: [...] }
+   Feldnamen sind tolerant (front/back, frage/antwort, question/answer …).
+   ===================================================================== */
+const JSON_TERM_KEYS = ['term', 'front', 'question', 'frage', 'vorderseite', 'q', 'word', 'wort', 'begriff', 'vokabel', 'title'];
+const JSON_DEF_KEYS  = ['def', 'definition', 'back', 'answer', 'antwort', 'rückseite', 'rueckseite', 'ruckseite', 'a', 'meaning', 'bedeutung', 'erklärung', 'erklarung', 'übersetzung', 'uebersetzung', 'translation'];
+const JSON_CAT_KEYS  = ['catlabel', 'cat', 'category', 'kategorie', 'deck', 'topic', 'thema', 'chapter', 'kapitel'];
+const JSON_IMG_KEYS  = ['image', 'img', 'picture', 'bild'];
+
+// Erstes Feld, dessen Schlüssel (case-insensitiv) auf eine der Keys passt
+const jsonPick = (obj, keys) => {
+  for (const k of Object.keys(obj)) {
+    if (keys.includes(k.toLowerCase().trim())) {
+      const v = obj[k];
+      if (v != null && v !== '') return v;
+    }
+  }
+  return '';
+};
+
+function jsonCard(obj) {
+  if (typeof obj === 'string') return obj.trim() ? mkCard({ term: obj.trim() }) : null;
+  if (!obj || typeof obj !== 'object') return null;
+  const term = String(jsonPick(obj, JSON_TERM_KEYS) || '').trim();
+  let def = jsonPick(obj, JSON_DEF_KEYS);
+  if (Array.isArray(def)) def = def.filter(Boolean).join(', ');
+  def = String(def || '').trim();
+  let cat = jsonPick(obj, JSON_CAT_KEYS);
+  if (Array.isArray(cat)) cat = cat.filter(Boolean).join(' › ');
+  cat = String(cat || '').trim();
+  const img = jsonPick(obj, JSON_IMG_KEYS);
+  const image = (typeof img === 'string' && /^data:image\//i.test(img)) ? img : null;
+  if (!term && !def && !image) return null;
+  return mkCard({ term, def, catLabel: cat, cat: '', image });
+}
+
+function jsonFolder(obj, fallbackName) {
+  const rawCards = Array.isArray(obj) ? obj : (obj.cards || obj.karten || obj.items || obj.notes || []);
+  const name = (!Array.isArray(obj) && (obj.name || obj.title || obj.deck)) || fallbackName;
+  const cards = (Array.isArray(rawCards) ? rawCards : []).map(jsonCard).filter(Boolean);
+  return { name: String(name).trim() || fallbackName, cards };
+}
+
+function parseJsonImport(fileName, text) {
+  let data;
+  try { data = JSON.parse(text); }
+  catch { throw new Error('JSON konnte nicht gelesen werden (ungültiges Format).'); }
+  const fallback = fileName.replace(/\.json$/i, '').replace(/[_-]+/g, ' ').trim() || 'Import';
+  const isFolderObj = (x) => x && typeof x === 'object' && !Array.isArray(x) &&
+    (Array.isArray(x.cards) || Array.isArray(x.karten));
+
+  // { folders: [...] }
+  if (data && !Array.isArray(data) && Array.isArray(data.folders)) {
+    return data.folders.map((f, i) => jsonFolder(f, `${fallback} ${i + 1}`));
+  }
+  if (Array.isArray(data)) {
+    // Array von Ordnern?
+    if (data.length && data.every(isFolderObj)) {
+      return data.map((f, i) => jsonFolder(f, `${fallback} ${i + 1}`));
+    }
+    return [jsonFolder(data, fallback)];     // sonst: Array von Karten
+  }
+  if (data && typeof data === 'object') {
+    if (isFolderObj(data)) return [jsonFolder(data, fallback)];
+    const c = jsonCard(data);               // einzelnes Karten-Objekt
+    return c ? [{ name: fallback, cards: [c] }] : [];
+  }
+  return [];
+}
+
+/* =====================================================================
+   APKG-Import (Anki) – läuft komplett im Browser
+   Ablauf:  .apkg (= ZIP)  →  entpacken (JSZip)
+            →  SQLite-DB lesen (sql.js)
+            →  Notizen + Decks  →  internes Karten-JSON (mkCard)
+   Beide Libs werden lazy per CDN geladen (wie Transformers.js).
+   ===================================================================== */
+let _jszipPromise = null;
+function loadJSZip() {
+  if (!_jszipPromise) {
+    _jszipPromise = import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm')
+      .then(m => m.default || m);
+  }
+  return _jszipPromise;
+}
+
+let _sqlPromise = null;
+function loadSqlJs() {
+  if (!_sqlPromise) {
+    _sqlPromise = import('https://esm.sh/sql.js@1.10.3')
+      .then(m => (m.default || m)({
+        locateFile: (f) => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${f}`,
+      }));
+  }
+  return _sqlPromise;
+}
+
+/* KaTeX – LaTeX-Formeln (\(…\), \[…\], $$…$$) im Browser rendern, lazy per CDN */
+let _katexPromise = null;
+function loadKatex() {
+  if (!_katexPromise) {
+    if (typeof document !== 'undefined' && !document.getElementById('katex-css')) {
+      const l = document.createElement('link');
+      l.id = 'katex-css'; l.rel = 'stylesheet';
+      l.href = 'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css';
+      document.head.appendChild(l);
+    }
+    _katexPromise = import('https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.mjs')
+      .then(m => m.default || m);
+  }
+  return _katexPromise;
+}
+async function renderMathIn(el) {
+  if (!el) return;
+  try {
+    const renderMathInElement = await loadKatex();
+    renderMathInElement(el, {
+      delimiters: [
+        { left: '\\(', right: '\\)', display: false },
+        { left: '\\[', right: '\\]', display: true },
+        { left: '$$', right: '$$', display: true },
+      ],
+      throwOnError: false,
+      ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+    });
+  } catch (e) { console.warn('KaTeX', e); }
+}
+
+// Erkennt, ob ein Feld Rich-Inhalt (HTML/LaTeX/Entities) enthält
+const isRich = (s) => /<[a-z!/][\s\S]*>|\\\(|\\\[|\$\$|&[a-z#0-9]+;/i.test(s || '');
+
+/* Rich-Renderer: zeigt importierte HTML-Karten (Bilder, Fett/Kursiv, LaTeX),
+   reine Textkarten (manuell angelegt) bleiben unverändert. */
+function RichText({ html, className, style }) {
+  const ref = useRef(null);
+  const rich = isRich(html);
+  useEffect(() => {
+    if (rich && ref.current) renderMathIn(ref.current);
+  }, [html, rich]);
+  if (!html) return <span className={className} style={style}>—</span>;
+  if (!rich)  return <span className={className} style={style}>{html}</span>;
+  return (
+    <span ref={ref} className={(className || '') + ' richtext'} style={style}
+      dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) }} />
+  );
+}
+
+// Reiner Text (für Suche, Sprachausgabe, Recall-Vergleich, Sortierung)
+function plainText(html) {
+  if (!html) return '';
+  let s = String(html)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(div|p|li|tr|h[1-6])>/gi, '\n')
+    .replace(/<[^>]+>/g, '')              // restliche Tags entfernen
+    .replace(/\[sound:[^\]]*\]/gi, '');   // Anki-Audioverweise raus
+  // HTML-Entities dekodieren
+  const ta = document.createElement('textarea');
+  ta.innerHTML = s;
+  s = ta.value
+    .replace(/\\[()[\]]/g, '')   // LaTeX-Trennzeichen \( \) \[ \] entfernen
+    .replace(/\$\$?/g, '');      // $ / $$ entfernen
+  return s.replace(/ /g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Ko-fi-Werbung & „No_Image_Available"-Platzhalter aus Anki-Decks entfernen
+function stripAnkiJunk(html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<a\b[^>]*ko-fi[^>]*>[\s\S]*?<\/a>/gi, '')                          // Affiliate-Links komplett
+    .replace(/<img[^>]*\b(?:No_Image_Available|Ko-fi|up-button)[^>]*>/gi, '')    // Platzhalter-/Werbebilder
+    .replace(/\[sound:[^\]]*\]/gi, '')
+    .trim();
+}
+
+// Hat ein Feld nach dem Säubern echten Inhalt? (kein Müll, keine reine Zahl)
+function isMeaningfulField(html) {
+  const clean = stripAnkiJunk(html);
+  if (/<img\b/i.test(clean)) return true;            // echtes Bild zählt
+  const t = plainText(clean);
+  return !!t && !/^\d+$/.test(t);                    // z. B. „Deck ID" 857020437 ausschließen
+}
+
+// Cloze {{c1::Antwort::Hinweis}}
+const CLOZE_RE = /\{\{c\d+::([\s\S]*?)\}\}/g;
+const hasCloze = (s) => /\{\{c\d+::/.test(s || '');
+function clozeParts(inner) {
+  const parts = inner.split('::');
+  const hint = parts.length > 1 ? parts.pop() : null;
+  return { answer: parts.join('::'), hint };
+}
+const clozeBlank  = (html) => String(html).replace(CLOZE_RE, (_, i) => {
+  const { hint } = clozeParts(i);
+  return `<span class="cloze-gap">[${hint ? plainText(hint) : '…'}]</span>`;
+});
+const clozeReveal = (html) => String(html).replace(CLOZE_RE, (_, i) =>
+  `<span class="cloze-fill">${clozeParts(i).answer}</span>`);
+
+// Sichere HTML-Bereinigung per Whitelist (Schutz vor Script-Injection)
+const ALLOWED_TAGS = new Set(['B','STRONG','I','EM','U','S','SUB','SUP','BR','DIV','P','SPAN','UL','OL','LI','IMG','CODE','PRE','TABLE','THEAD','TBODY','TR','TD','TH','BLOCKQUOTE']);
+const DROP_TAGS    = new Set(['SCRIPT','STYLE','IFRAME','OBJECT','EMBED','LINK','META','HEAD','TITLE','SVG','MATH','AUDIO','VIDEO','SOURCE','FORM','INPUT','BUTTON']);
+const ALLOWED_ATTR = { IMG: ['src','alt'], SPAN: ['class'], DIV: ['class'], TD: ['colspan','rowspan'], TH: ['colspan','rowspan'] };
+function sanitizeHtml(html) {
+  if (!html) return '';
+  const body = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html').body;
+  const clean = (src) => {
+    const frag = document.createDocumentFragment();
+    src.childNodes.forEach((node) => {
+      if (node.nodeType === 3) { frag.appendChild(document.createTextNode(node.nodeValue)); return; }
+      if (node.nodeType !== 1) return;
+      const tag = node.tagName;
+      if (DROP_TAGS.has(tag)) return;                                            // komplett verwerfen
+      if (!ALLOWED_TAGS.has(tag)) { frag.appendChild(clean(node)); return; }     // entpacken, Inhalt behalten
+      const el = document.createElement(tag);
+      const allow = ALLOWED_ATTR[tag] || [];
+      [...node.attributes].forEach((a) => {
+        const n = a.name.toLowerCase();
+        if (!allow.includes(n)) return;
+        if (n === 'src' && !/^data:image\//i.test(a.value)) return;              // nur Inline-Base64 zulassen
+        el.setAttribute(n, a.value);
+      });
+      el.appendChild(clean(node));
+      frag.appendChild(el);
+    });
+    return frag;
+  };
+  const out = document.createElement('div');
+  out.appendChild(clean(body));
+  return out.innerHTML;
+}
+
+async function parseApkg(file) {
+  const [JSZip, SQL] = await Promise.all([loadJSZip(), loadSqlJs()]);
+  const zip = await JSZip.loadAsync(file);
+
+  // Datenbank-Datei wählen (neuere zuerst). Das neueste zstd-komprimierte
+  // Format (.anki21b) können wir ohne zstd-Lib nicht lesen.
+  const dbName = ['collection.anki21', 'collection.anki2'].find(n => zip.file(n));
+  if (!dbName) {
+    if (zip.file('collection.anki21b'))
+      throw new Error('Dieses Anki-Paket nutzt das neue komprimierte Format. Bitte in Anki erneut exportieren und dabei „Unterstützung für ältere Anki-Versionen" aktivieren.');
+    throw new Error('Keine Anki-Datenbank im Paket gefunden.');
+  }
+
+  const buf = await zip.file(dbName).async('uint8array');
+  const db = new SQL.Database(buf);
+
+  // Medien-Mapping  { "0": "bild.png", ... }  →  Originalname → Zip-Eintrag
+  let mediaMap = {};
+  const mediaEntry = zip.file('media');
+  if (mediaEntry) { try { mediaMap = JSON.parse(await mediaEntry.async('string')); } catch {} }
+  const numByName = {};
+  for (const [num, name] of Object.entries(mediaMap)) numByName[name] = num;
+
+  const mediaCache = {};
+  async function imageDataUrl(name) {
+    if (!name) return null;
+    if (name in mediaCache) return mediaCache[name];
+    const num = numByName[name];
+    const entry = num != null ? zip.file(String(num)) : zip.file(name);
+    if (!entry) return (mediaCache[name] = null);
+    const b64 = await entry.async('base64');
+    const ext = (name.split('.').pop() || 'png').toLowerCase();
+    const mime = (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg'
+      : ext === 'gif' ? 'image/gif'
+      : ext === 'svg' ? 'image/svg+xml'
+      : ext === 'webp' ? 'image/webp' : 'image/png';
+    return (mediaCache[name] = `data:${mime};base64,${b64}`);
+  }
+
+  // <img src="datei"> → <img src="data:…base64,…">  (mehrere Bilder bleiben inline)
+  const decodeEntities = (s) => { const ta = document.createElement('textarea'); ta.innerHTML = s; return ta.value; };
+  async function inlineImages(html) {
+    if (!html || !/<img/i.test(html)) return html;
+    const names = new Set();
+    const RE = /<img[^>]+src\s*=\s*"([^"]+)"/gi; let m;
+    while ((m = RE.exec(html))) names.add(m[1]);
+    const map = {};
+    for (const n of names) map[n] = await imageDataUrl(decodeEntities(n));
+    return html.replace(/(<img[^>]+src\s*=\s*")([^"]+)(")/gi,
+      (full, pre, src, post) => map[src] ? `${pre}${map[src]}${post}` : '');   // unauffindbar → Bild raus
+  }
+
+  // col-Tabelle: Modelle (Feld-Reihenfolge) + Decks (Namen) als JSON
+  let models = {}, decks = {};
+  try {
+    const colRes = db.exec('SELECT models, decks FROM col LIMIT 1');
+    if (colRes.length) {
+      const [m, d] = colRes[0].values[0];
+      models = JSON.parse(m || '{}');
+      decks  = JSON.parse(d || '{}');
+    }
+  } catch {}
+  const sortIdx = {};
+  for (const [mid, model] of Object.entries(models)) sortIdx[mid] = model.sortf || 0;
+
+  // Notizen samt zugehörigem Deck lesen
+  const res = db.exec(
+    'SELECT n.mid, n.flds, c.did FROM notes n JOIN cards c ON c.nid = n.id GROUP BY n.id'
+  );
+
+  const fallbackName = file.name.replace(/\.apkg$/i, '');
+  const items = [];   // { deckName, termHtml, defHtml }
+  if (res.length) {
+    for (const [mid, flds, did] of res[0].values) {
+      const fields = String(flds).split('');
+      const sf = sortIdx[mid] || 0;
+      const termRaw = stripAnkiJunk(fields[sf] ?? fields[0] ?? '');
+
+      let termHtml; const defParts = [];
+      if (hasCloze(termRaw)) {
+        // Cloze-Notiz: Vorderseite mit Lücken, Rückseite mit eingeblendeten Lösungen
+        termHtml = clozeBlank(termRaw);
+        defParts.push(clozeReveal(termRaw));
+      } else {
+        termHtml = termRaw;
+      }
+      // Übrige sinnvolle Felder (Antwort / Erklärung) an die Rückseite anhängen
+      fields.forEach((f, i) => { if (i !== sf && isMeaningfulField(f)) defParts.push(stripAnkiJunk(f)); });
+      const defHtml = defParts.join('<br><br>');
+
+      if (!plainText(termHtml) && !plainText(defHtml) && !/<img/i.test(termHtml + defHtml)) continue;
+      const deckName = (decks[did] && decks[did].name) || fallbackName;
+      items.push({ deckName, termHtml, defHtml });
+    }
+  }
+  db.close();
+
+  // Alle (Unter-)Decks zu EINEM Import zusammenfassen – Unterdeck wird Kategorie-Label.
+  // (Die App kennt keine verschachtelten Ordner: ein Ordner + Tag je Kapitel.)
+  const firsts   = items.map(it => it.deckName.split('::')[0]);
+  const allSame  = firsts.length > 0 && firsts.every(f => f === firsts[0]);
+  const rootName = (allSame ? firsts[0] : fallbackName) || 'Anki-Import';
+
+  const cards = [];
+  for (const it of items) {
+    const term = sanitizeHtml(await inlineImages(it.termHtml));
+    const def  = sanitizeHtml(await inlineImages(it.defHtml));
+    const sub  = allSame
+      ? it.deckName.split('::').slice(1).join(' › ')
+      : it.deckName.replace(/::/g, ' › ');
+    cards.push(mkCard({ term, def, catLabel: sub === rootName ? '' : sub }));
+  }
+  if (!cards.length) throw new Error('Keine Karten im Anki-Paket erkannt.');
+  return [{ name: rootName.trim(), cards }];
+}
+
+/* =====================================================================
    IndexedDB – persistiert das File-System-Handle
    ===================================================================== */
 const supportsFS = typeof window !== 'undefined' && 'showDirectoryPicker' in window;
@@ -209,6 +633,9 @@ function dbRowToCard(row) {
     ease:           row.ease,
     interval:       row.interval,
     repetitions:    row.repetitions,
+    stability:      row.stability,
+    difficulty:     row.difficulty,
+    lastReview:     row.last_review,
     due:            row.due,
     totalReviews:   row.total_reviews,
     correctReviews: row.correct_reviews,
@@ -230,10 +657,27 @@ function cardToDb(card, folderId, userId) {
     ease:            card.ease,
     interval:        card.interval,
     repetitions:     card.repetitions,
+    stability:       card.stability ?? null,
+    difficulty:      card.difficulty ?? null,
+    last_review:     card.lastReview || null,
     due:             card.due,
     total_reviews:   card.totalReviews,
     correct_reviews: card.correctReviews,
     created_at:      card.createdAt,
+  };
+}
+
+// Eine Bewertung → Zeile fürs Review-Log (append-only, siehe reviews_table.sql)
+function reviewToDb(card, folderId, userId, quality) {
+  return {
+    user_id:     userId,
+    card_id:     card.id,
+    folder_id:   folderId,
+    reviewed_at: new Date().toISOString(),
+    quality,
+    interval:    card.interval,     // Zustand NACH applySM2
+    ease:        card.ease,
+    repetitions: card.repetitions,
   };
 }
 
@@ -301,6 +745,21 @@ function useLearningStore(toast, userId) {
       setFolders(parsed);
       if (parsed.length) setActiveFolderId(parsed[0].id);
       setLoading(false);
+
+      // Lernverlauf autoritativ aus dem Review-Log aufbauen (geräteübergreifend).
+      // Best effort: fehlt die Tabelle noch, bleibt der localStorage-Cache aktiv.
+      const since = new Date(Date.now() - 90 * MS_DAY).toISOString();
+      const { data: reviewRows, error: rErr } = await supabase
+        .from('reviews')
+        .select('reviewed_at')
+        .eq('user_id', userId)
+        .gte('reviewed_at', since);
+      if (!rErr && reviewRows) {
+        const h = {};
+        reviewRows.forEach(r => { const k = dayStr(new Date(r.reviewed_at)); h[k] = (h[k] || 0) + 1; });
+        setHistory(h);
+        try { localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); } catch {}
+      }
     })();
   }, [userId]); // eslint-disable-line
 
@@ -426,7 +885,7 @@ function useLearningStore(toast, userId) {
     if (!folder) return;
     const card    = folder.cards.find(c => c.id === cardId);
     if (!card) return;
-    const updated = applySM2(card, quality);
+    const updated = applyFSRS(card, quality);
     const updatedFolder = applyStreak(folder);
 
     // Karte + Ordner-Streak parallel updaten
@@ -438,6 +897,12 @@ function useLearningStore(toast, userId) {
         .update({ streak: updatedFolder.streak, last_studied: updatedFolder.lastStudied })
         .eq('id', folderId).eq('user_id', userId),
     ]);
+
+    // Review-Log (append-only). Fire-and-forget: ein Fehler (z. B. fehlende
+    // Tabelle) darf die Wiederholung nicht stören.
+    supabase.from('reviews')
+      .insert(reviewToDb(updated, folderId, userId, quality))
+      .then(({ error }) => { if (error) console.warn('Review-Log:', error.message); });
 
     setFolders(prev => prev.map(f => {
       if (f.id !== folderId) return f;
@@ -623,10 +1088,11 @@ function useSpeech() {
 
 // Kleiner Lautsprecher-Button, wiederverwendbar
 function SpeakButton({ text, speech }) {
-  if (!text) return null;
+  const spoken = plainText(text);            // HTML/LaTeX-Markup nicht mitsprechen
+  if (!spoken) return null;
   return (
     <button
-      onClick={(e) => { e.stopPropagation(); speech.speaking ? speech.stop() : speech.speak(text); }}
+      onClick={(e) => { e.stopPropagation(); speech.speaking ? speech.stop() : speech.speak(spoken); }}
       title={speech.speaking ? 'Stoppen' : 'Vorlesen'}
       style={{
         display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
@@ -749,6 +1215,17 @@ const CATS = {
   urheberrecht: { label: 'Urheberrecht', cls: 'cat-urheberrecht' },
 };
 const catClass = (c) => (CATS[c]?.cls) || 'cat-default';
+
+/* ---------- Kategorie-/Filter-Logik ---------- */
+// Anzeigename der Kategorie einer Karte (catLabel aus Import oder cat-Schlüssel)
+const cardCat = (c) => c.catLabel || (c.cat ? (CATS[c.cat]?.label || c.cat) : '');
+// filter: { type:'all' } | { type:'hard' } | { type:'cat', value }
+function matchesFilter(card, filter) {
+  if (!filter || filter.type === 'all') return true;
+  if (filter.type === 'hard') return isHard(card);
+  if (filter.type === 'cat')  return cardCat(card) === filter.value;
+  return true;
+}
 
 function Modal({ title, onClose, children, footer, wide }) {
   useEffect(() => {
@@ -908,6 +1385,58 @@ const ORDER_OPTIONS = [
   { id: 'term_desc', label: 'Z → A',        icon: '🔤' },
 ];
 
+function FilterMenu({ folder, filter, setFilter }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    const h = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, []);
+  const cats = useMemo(() => {
+    const m = new Map();
+    folder.cards.forEach(c => { const k = cardCat(c); if (k) m.set(k, (m.get(k) || 0) + 1); });
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0], 'de'));
+  }, [folder]);
+  const hardCount = useMemo(() => folder.cards.filter(isHard).length, [folder]);
+
+  // Nichts zu filtern → Menü ausblenden
+  if (!cats.length && !hardCount) return null;
+
+  const label = filter.type === 'all' ? 'Alle'
+    : filter.type === 'hard' ? 'Schwierige'
+    : filter.value;
+  const pick = (f) => { setFilter(f); setOpen(false); };
+
+  return (
+    <div className="menu-wrap" ref={ref}>
+      <button className={'btn sm' + (filter.type !== 'all' ? ' primary' : '')}
+        onClick={() => setOpen(o => !o)} title="Filter">
+        <Filter size={15} /><span className="hide-mobile">{label}</span><ChevronDown size={13} />
+      </button>
+      {open && (
+        <div className="menu" style={{ maxHeight: 340, overflowY: 'auto' }}>
+          <button onClick={() => pick({ type: 'all' })}
+            style={{ fontWeight: filter.type === 'all' ? 600 : 400 }}>Alle Karten</button>
+          <button onClick={() => hardCount && pick({ type: 'hard' })} disabled={!hardCount}
+            style={{ fontWeight: filter.type === 'hard' ? 600 : 400, opacity: hardCount ? 1 : .45,
+              color: filter.type === 'hard' ? 'var(--accent-text)' : undefined }}>
+            ⚠️ Schwierige ({hardCount})
+          </button>
+          {cats.length > 0 && <div style={{ height: 1, background: 'var(--border)', margin: '5px 0' }} />}
+          {cats.map(([name, n]) => (
+            <button key={name} onClick={() => pick({ type: 'cat', value: name })}
+              style={{ fontWeight: filter.type === 'cat' && filter.value === name ? 600 : 400,
+                color: filter.type === 'cat' && filter.value === name ? 'var(--accent-text)' : undefined }}>
+              {name} <span style={{ color: 'var(--text-3)' }}>({n})</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OrderMenu({ order, setOrder }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
@@ -937,7 +1466,7 @@ function OrderMenu({ order, setOrder }) {
   );
 }
 
-function Topbar({ folder, mode, setMode, order, setOrder, onMenu, onStats, onNewCard, toast }) {
+function Topbar({ folder, mode, setMode, order, setOrder, filter, setFilter, onMenu, onStats, onNewCard, toast }) {
   const due = folder ? folder.cards.filter(isDue).length : 0;
   return (
     <header className="topbar">
@@ -961,6 +1490,7 @@ function Topbar({ folder, mode, setMode, order, setOrder, onMenu, onStats, onNew
 
       {folder && (
         <div className="topbar-actions">
+          <FilterMenu folder={folder} filter={filter} setFilter={setFilter} />
           <OrderMenu order={order} setOrder={setOrder} />
           <button className="btn sm" onClick={onStats} title="Statistiken"><BarChart3 size={15} /></button>
           <ExportMenu folder={folder} toast={toast} />
@@ -1062,8 +1592,8 @@ function applyOrder(cards, orderMode) {
     case 'shuffle':   return shuffleArr(ids);
     case 'due':       return [...cards].sort((a, b) => new Date(a.due) - new Date(b.due)).map(c => c.id);
     case 'reverse':   return [...ids].reverse();
-    case 'term_asc':  return [...cards].sort((a, b) => a.term.localeCompare(b.term, 'de')).map(c => c.id);
-    case 'term_desc': return [...cards].sort((a, b) => b.term.localeCompare(a.term, 'de')).map(c => c.id);
+    case 'term_asc':  return [...cards].sort((a, b) => plainText(a.term).localeCompare(plainText(b.term), 'de')).map(c => c.id);
+    case 'term_desc': return [...cards].sort((a, b) => plainText(b.term).localeCompare(plainText(a.term), 'de')).map(c => c.id);
     default:          return ids;
   }
 }
@@ -1084,8 +1614,8 @@ function BrowseView({ folder, order: orderMode, onEdit, onDelete, onImageDrop })
       .filter(card => {
         if (!q) return true;
         return (
-          card.term.toLowerCase().includes(q) ||
-          (card.def || '').toLowerCase().includes(q) ||
+          plainText(card.term).toLowerCase().includes(q) ||
+          plainText(card.def).toLowerCase().includes(q) ||
           (card.catLabel || '').toLowerCase().includes(q)
         );
       });
@@ -1202,14 +1732,14 @@ function BrowseCard({ card, index, speech, cardRef, onEdit, onDelete, onImageDro
             fontFamily: 'DM Mono, monospace', fontSize: 15, fontWeight: 500,
             color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
           }}>
-            {card.term}
+            {plainText(card.term)}
           </div>
-          {!expanded && card.def && (
+          {!expanded && plainText(card.def) && (
             <div style={{
               fontSize: 13, color: 'var(--text-3)', marginTop: 2,
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
             }}>
-              {card.def}
+              {plainText(card.def)}
             </div>
           )}
         </div>
@@ -1250,7 +1780,7 @@ function BrowseCard({ card, index, speech, cardRef, onEdit, onDelete, onImageDro
           </div>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
             <div style={{ fontSize: 14, lineHeight: 1.65, whiteSpace: 'pre-wrap', color: 'var(--text)', flex: 1 }}>
-              {card.def || '—'}
+              <RichText html={card.def} />
             </div>
             <SpeakButton text={card.def} speech={speech} />
           </div>
@@ -1282,16 +1812,17 @@ const RATINGS = [
   { q: 5, label: 'Leicht', key: '4', tone: 'easy' },
 ];
 
-function LearnView({ folder, order: orderMode, onReview }) {
+function LearnView({ folder, order: orderMode, onReview, studyAll }) {
+  // studyAll=true (z. B. „Schwierige"-Filter): alle Karten lernen, nicht nur fällige
   const buildQueue = (cards, mode) => {
-    const due = cards.filter(isDue);
+    const base = studyAll ? cards : cards.filter(isDue);
     switch (mode) {
-      case 'shuffle':   return shuffleArr(due.map(c => c.id));
-      case 'due':       return [...due].sort((a, b) => new Date(a.due) - new Date(b.due)).map(c => c.id);
-      case 'reverse':   return [...due].reverse().map(c => c.id);
-      case 'term_asc':  return [...due].sort((a, b) => a.term.localeCompare(b.term, 'de')).map(c => c.id);
-      case 'term_desc': return [...due].sort((a, b) => b.term.localeCompare(a.term, 'de')).map(c => c.id);
-      default:          return due.map(c => c.id);
+      case 'shuffle':   return shuffleArr(base.map(c => c.id));
+      case 'due':       return [...base].sort((a, b) => new Date(a.due) - new Date(b.due)).map(c => c.id);
+      case 'reverse':   return [...base].reverse().map(c => c.id);
+      case 'term_asc':  return [...base].sort((a, b) => plainText(a.term).localeCompare(plainText(b.term), 'de')).map(c => c.id);
+      case 'term_desc': return [...base].sort((a, b) => plainText(b.term).localeCompare(plainText(a.term), 'de')).map(c => c.id);
+      default:          return base.map(c => c.id);
     }
   };
   const [queue, setQueue]       = useState(() => buildQueue(folder.cards, orderMode));
@@ -1380,8 +1911,8 @@ function LearnView({ folder, order: orderMode, onReview }) {
           🔁 Fehler-Runde · {errorIds.length} Karte{errorIds.length !== 1 ? 'n' : ''} übrig
         </div>
         <CardShell flipped={errorFlipped} onClick={() => !errorFlipped && setErrorFlipped(true)}
-          front={<><CatBadge card={errorCard} /><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="term" style={{ flex: 1 }}>{errorCard.term}</div><SpeakButton text={errorCard.term} speech={speech} /></div><CardImage src={errorCard.image} /></>}
-          back={<><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="def" style={{ flex: 1 }}>{errorCard.def || '—'}</div><SpeakButton text={errorCard.def} speech={speech} /></div><CardImage src={errorCard.image} /></>} />
+          front={<><CatBadge card={errorCard} /><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="term" style={{ flex: 1 }}><RichText html={errorCard.term} /></div><SpeakButton text={errorCard.term} speech={speech} /></div><CardImage src={errorCard.image} /></>}
+          back={<><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="def" style={{ flex: 1 }}><RichText html={errorCard.def} /></div><SpeakButton text={errorCard.def} speech={speech} /></div><CardImage src={errorCard.image} /></>} />
         {!errorFlipped ? (
           <p className="hint">Klicken zum Umdrehen · Leertaste</p>
         ) : (
@@ -1432,8 +1963,8 @@ function LearnView({ folder, order: orderMode, onReview }) {
     <div className="card-wrap">
       <div className="progress"><div className="progress-fill" style={{ width: (stats.done / (stats.done + remaining) * 100) + '%' }} /></div>
       <CardShell flipped={flipped} onClick={() => setFlipped(f => !f)}
-        front={<><CatBadge card={card} /><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="term" style={{ flex: 1 }}>{card.term}</div><SpeakButton text={card.term} speech={speech} /></div><CardImage src={card.image} /></>}
-        back={<><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="def" style={{ flex: 1 }}>{card.def || '—'}</div><SpeakButton text={card.def} speech={speech} /></div><CardImage src={card.image} /></>} />
+        front={<><CatBadge card={card} /><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="term" style={{ flex: 1 }}><RichText html={card.term} /></div><SpeakButton text={card.term} speech={speech} /></div><CardImage src={card.image} /></>}
+        back={<><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="def" style={{ flex: 1 }}><RichText html={card.def} /></div><SpeakButton text={card.def} speech={speech} /></div><CardImage src={card.image} /></>} />
       {!flipped ? (
         <p className="hint">Klicken zum Umdrehen · Leertaste · {remaining} übrig</p>
       ) : (
@@ -1527,15 +2058,16 @@ function RecallView({ folder, order: orderMode, onReview }) {
 
   const getHint = (c, level) => {
     if (!c || level === 0) return null;
-    return (c.def || c.term).slice(0, level) + '…';
+    return (plainText(c.def) || plainText(c.term)).slice(0, level) + '…';
   };
 
   const computeScore = useCallback(async (userAnswer, targetCard) => {
+    const target = plainText(targetCard.def) || plainText(targetCard.term);
     try {
-      return await embedder.similarity(userAnswer.trim(), targetCard.def || targetCard.term);
+      return await embedder.similarity(userAnswer.trim(), target);
     } catch {
       const a = userAnswer.trim().toLowerCase();
-      const d = (targetCard.def || '').toLowerCase();
+      const d = target.toLowerCase();
       return d.includes(a) ? 0.85 : a.split(' ').some(w => w.length > 3 && d.includes(w)) ? 0.60 : 0.20;
     }
   }, [embedder]);
@@ -1625,7 +2157,7 @@ function RecallView({ folder, order: orderMode, onReview }) {
         <div className="card recall">
           <CatBadge card={erCard} />
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-            <div className="term" style={{ flex: 1 }}>{erCard.term}</div>
+            <div className="term" style={{ flex: 1 }}><RichText html={erCard.term} /></div>
             <SpeakButton text={erCard.term} speech={speech} />
           </div>
           <CardImage src={erCard.image} />
@@ -1642,7 +2174,7 @@ function RecallView({ folder, order: orderMode, onReview }) {
             <div className="reveal fade-up">
               <div className="reveal-label">Musterlösung</div>
               <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                <div className="def" style={{ flex: 1 }}>{erCard.def || '—'}</div>
+                <div className="def" style={{ flex: 1 }}><RichText html={erCard.def} /></div>
                 <SpeakButton text={erCard.def} speech={speech} />
               </div>
             </div>
@@ -1723,7 +2255,7 @@ function RecallView({ folder, order: orderMode, onReview }) {
       <div className="card recall">
         <CatBadge card={card} />
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-          <div className="term" style={{ flex: 1 }}>{card.term}</div>
+          <div className="term" style={{ flex: 1 }}><RichText html={card.term} /></div>
           <SpeakButton text={card.term} speech={speech} />
         </div>
         <CardImage src={card.image} />
@@ -1740,7 +2272,7 @@ function RecallView({ folder, order: orderMode, onReview }) {
           <div className="reveal fade-up">
             <div className="reveal-label">Musterlösung</div>
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-              <div className="def" style={{ flex: 1 }}>{card.def || '—'}</div>
+              <div className="def" style={{ flex: 1 }}><RichText html={card.def} /></div>
               <SpeakButton text={card.def} speech={speech} />
             </div>
           </div>
@@ -2082,6 +2614,7 @@ export default function App() {
 
   const [mode, setMode] = useState('learn');
   const [order, setOrder] = useState('normal');
+  const [filter, setFilter] = useState({ type: 'all' });   // { type:'all'|'hard'|'cat', value? }
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showStats, setShowStats] = useState(false);
   const [showTTSSettings, setShowTTSSettings] = useState(false);
@@ -2110,23 +2643,64 @@ export default function App() {
   }, [mode, dialog, showStats]);
 
   /* ---- Datei-Import (Drag&Drop + Dialog) ---- */
-  const handleFiles = useCallback((fileList) => {
-    const files = [...fileList].filter(f => /\.(html?|csv)$/i.test(f.name));
-    if (!files.length) return toast('Nur HTML- oder CSV-Dateien');
-    let pending = files.length; const parsed = [];
-    files.forEach(file => {
-      const r = new FileReader();
-      r.onload = (e) => {
-        const cards = parseFile(file.name, e.target.result);
-        parsed.push({ name: file.name.replace(/\.(html?|csv)$/i, '').replace(/[_-]+/g, ' ').trim() || 'Import', cards });
-        if (--pending === 0) {
-          const valid = parsed.filter(p => p.cards.length);
-          if (!valid.length) return toast('Keine Karten erkannt');
-          setImportQueue(valid);
+  const handleFiles = useCallback(async (fileList) => {
+    const all   = [...fileList];
+    const apkgs = all.filter(f => /\.apkg$/i.test(f.name));
+    const jsons = all.filter(f => /\.json$/i.test(f.name));
+    const texts = all.filter(f => /\.(html?|csv)$/i.test(f.name));
+    if (!apkgs.length && !jsons.length && !texts.length)
+      return toast('Nur Anki (.apkg), JSON, HTML- oder CSV-Dateien');
+
+    const collected = [];
+
+    // Anki-Pakete (asynchron entpacken + konvertieren)
+    if (apkgs.length) {
+      toast(apkgs.length > 1 ? 'Anki-Pakete werden eingelesen …' : 'Anki-Paket wird eingelesen …');
+      for (const file of apkgs) {
+        try {
+          collected.push(...await parseApkg(file));
+        } catch (err) {
+          console.error('APKG-Import', err);
+          toast(err.message || 'Anki-Import fehlgeschlagen');
         }
-      };
-      r.readAsText(file);
-    });
+      }
+    }
+
+    // JSON (kann mehrere Ordner enthalten)
+    if (jsons.length) {
+      const readText = (file) => new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload  = (e) => res(e.target.result);
+        r.onerror = () => rej(r.error);
+        r.readAsText(file);
+      });
+      for (const file of jsons) {
+        try {
+          collected.push(...parseJsonImport(file.name, await readText(file)));
+        } catch (err) {
+          console.error('JSON-Import', err);
+          toast(err.message || 'JSON-Import fehlgeschlagen');
+        }
+      }
+    }
+
+    // HTML / CSV (FileReader → Promise)
+    if (texts.length) {
+      const parsedTexts = await Promise.all(texts.map(file => new Promise(res => {
+        const r = new FileReader();
+        r.onload  = (e) => res({
+          name: file.name.replace(/\.(html?|csv)$/i, '').replace(/[_-]+/g, ' ').trim() || 'Import',
+          cards: parseFile(file.name, e.target.result),
+        });
+        r.onerror = () => res({ name: 'Import', cards: [] });
+        r.readAsText(file);
+      })));
+      collected.push(...parsedTexts);
+    }
+
+    const valid = collected.filter(p => p.cards.length);
+    if (!valid.length) return toast('Keine Karten erkannt');
+    setImportQueue(valid);
   }, [toast]);
 
   const [dragging, setDragging] = useState(false);
@@ -2150,6 +2724,9 @@ export default function App() {
 
   const advanceImport = () => setImportQueue(q => q.slice(1));
 
+  /* Filter zurücksetzen, wenn der Ordner wechselt */
+  useEffect(() => { setFilter({ type: 'all' }); }, [activeFolder?.id]);
+
   /* ---- Render Stage ---- */
   const renderStage = () => {
     const f = activeFolder;
@@ -2158,7 +2735,7 @@ export default function App() {
         <div className="empty">
           <div className="empty-icon">🗂️</div>
           <h2>Noch keine Karten</h2>
-          <p>Ziehe eine HTML- oder CSV-Datei ins Fenster oder lege manuell eine Karte an.</p>
+          <p>Ziehe ein Anki-Deck (.apkg), eine JSON-, HTML- oder CSV-Datei ins Fenster oder lege manuell eine Karte an.</p>
           <div className="empty-actions">
             <button className="btn primary" onClick={() => setDialog({ type: 'card' })}><Plus size={15} />Neue Karte</button>
             <button className="btn" onClick={() => fileInputRef.current?.click()}><Upload size={15} />Importieren</button>
@@ -2166,12 +2743,32 @@ export default function App() {
         </div>
       );
     }
-    if (mode === 'browse') return <BrowseView folder={f} order={order}
+    // Aktiven Filter anwenden (Schwierige / Kategorie)
+    const filtered = filter.type === 'all' ? f.cards : f.cards.filter(c => matchesFilter(c, filter));
+    if (filtered.length === 0) {
+      return (
+        <div className="empty">
+          <div className="empty-icon">🔍</div>
+          <h2>Keine Karten in diesem Filter</h2>
+          <p>{filter.type === 'hard'
+            ? 'Aktuell sind keine Karten als schwierig eingestuft – gut gemacht!'
+            : 'In dieser Kategorie gibt es keine Karten.'}</p>
+          <div className="empty-actions">
+            <button className="btn primary" onClick={() => setFilter({ type: 'all' })}>Filter zurücksetzen</button>
+          </div>
+        </div>
+      );
+    }
+    const ff   = { ...f, cards: filtered };
+    const fkey = f.id + ':' + filter.type + ':' + (filter.value || '');
+
+    if (mode === 'browse') return <BrowseView key={fkey} folder={ff} order={order}
       onEdit={(card, onScrollBack) => setDialog({ type: 'card', card, onScrollBack })}
       onDelete={(card) => { if (confirm('Diese Karte löschen?')) { store.deleteCard(f.id, card.id); toast('Karte gelöscht'); } }}
       onImageDrop={(cardId, image) => store.updateCardImage(f.id, cardId, image)} />;
-    if (mode === 'learn') return <LearnView folder={f} order={order} onReview={store.reviewCard} />;
-    return <RecallView folder={f} order={order} onReview={store.reviewCard} />;
+    if (mode === 'learn') return <LearnView key={fkey} folder={ff} order={order}
+      onReview={store.reviewCard} studyAll={filter.type === 'hard'} />;
+    return <RecallView key={fkey} folder={ff} order={order} onReview={store.reviewCard} />;
   };
 
   return (
@@ -2198,7 +2795,7 @@ export default function App() {
 
         <main className="main">
           <Topbar folder={activeFolder} mode={mode} setMode={setMode}
-            order={order} setOrder={setOrder}
+            order={order} setOrder={setOrder} filter={filter} setFilter={setFilter}
             onMenu={() => setSidebarOpen(true)} onStats={() => setShowStats(true)}
             onNewCard={() => setDialog({ type: 'card' })} toast={toast} />
           {activeFolder && (
@@ -2245,7 +2842,7 @@ export default function App() {
 
         {dragging && (
           <div className="drop-overlay">
-            <div className="drop-box">📄 Datei hier ablegen<br /><span>HTML oder CSV · du wählst danach das Ziel</span></div>
+            <div className="drop-box">📄 Datei hier ablegen<br /><span>Anki (.apkg), JSON, HTML oder CSV · du wählst danach das Ziel</span></div>
           </div>
         )}
 
@@ -2283,7 +2880,7 @@ export default function App() {
             onConfirm={(target) => { store.importCards(target, importQueue[0].cards); toast(`${importQueue[0].cards.length} Karte(n) importiert`); advanceImport(); }} />
         )}
 
-        <input ref={fileInputRef} type="file" accept=".html,.htm,.csv" multiple style={{ display: 'none' }}
+        <input ref={fileInputRef} type="file" accept=".apkg,.json,.html,.htm,.csv" multiple style={{ display: 'none' }}
           onChange={(e) => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
 
         {/* Abmelden + User-Info */}
@@ -2420,6 +3017,14 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .cat{font-size:11px;padding:3px 10px;border-radius:999px;align-self:flex-start;margin-bottom:1rem;font-weight:500}
 .term{font-size:23px;font-weight:500;line-height:1.35;letter-spacing:-.01em}
 .def{font-size:15px;line-height:1.7;white-space:pre-wrap;color:var(--text)}
+/* Rich-Inhalt aus Anki-Import (HTML, Bilder, LaTeX, Cloze) */
+.richtext{display:block;white-space:normal}
+.richtext img{max-width:100%;max-height:300px;height:auto;border-radius:8px;margin:.4rem 0;display:block}
+.richtext p{margin:.3rem 0}
+.richtext ul,.richtext ol{margin:.3rem 0;padding-left:1.3rem}
+.richtext .katex{font-size:1.02em}
+.cloze-gap{color:var(--accent-text);font-weight:600;background:var(--accent-soft);border-radius:5px;padding:0 5px}
+.cloze-fill{color:var(--accent-text);font-weight:600}
 .hint{font-size:12px;color:var(--text-3);text-align:center;margin-top:1rem}
 .nav{display:flex;align-items:center;justify-content:space-between;margin-top:1.25rem}
 .nav.center{justify-content:center}
