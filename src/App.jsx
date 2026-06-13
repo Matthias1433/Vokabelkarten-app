@@ -1069,69 +1069,205 @@ function applyOrder(cards, orderMode) {
 }
 
 function BrowseView({ folder, order: orderMode, onEdit, onDelete, onImageDrop }) {
-  const order = useMemo(() => applyOrder(folder.cards, orderMode),
+  const orderedIds = useMemo(() => applyOrder(folder.cards, orderMode),
     [folder.cards, orderMode]); // eslint-disable-line
-  const [idx, setIdx] = useState(0);
-  const [flipped, setFlipped] = useState(false);
-  const [seen, setSeen] = useState(() => new Set());
+
+  const [search, setSearch] = useState('');
+  const cardRefs = useRef({});
   const speech = useSpeech();
 
-  useEffect(() => { setIdx(0); setFlipped(false); setSeen(new Set()); }, [order]);
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return orderedIds
+      .map(id => folder.cards.find(c => c.id === id))
+      .filter(Boolean)
+      .filter(card => {
+        if (!q) return true;
+        return (
+          card.term.toLowerCase().includes(q) ||
+          (card.def || '').toLowerCase().includes(q) ||
+          (card.catLabel || '').toLowerCase().includes(q)
+        );
+      });
+  }, [orderedIds, folder.cards, search]);
 
-  const n = order.length;
-  const card = folder.cards.find(c => c.id === order[idx]) || folder.cards[0];
+  const handleEdit = (card) => {
+    onEdit(card, () => {
+      // Callback: nach dem Speichern zur Karte scrollen
+      setTimeout(() => {
+        cardRefs.current[card.id]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 80);
+    });
+  };
 
-  const go = useCallback((i) => { speech.stop(); setIdx((i + n) % n); setFlipped(false); }, [n, speech]);
-  const flip = useCallback(() => {
-    setFlipped(f => { if (!f) setSeen(s => new Set(s).add(idx)); return !f; });
-  }, [idx]);
-
-  const imgDrop = useCardImageDrop((base64) => card && onImageDrop(card.id, base64));
-
-  useEffect(() => {
-    const h = (e) => {
-      if (isTyping()) return;
-      if (e.key === 'ArrowRight') go(idx + 1);
-      else if (e.key === 'ArrowLeft') go(idx - 1);
-      else if (e.key === ' ') { e.preventDefault(); flip(); }
-    };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [idx, go, flip]);
-
-  if (!card) return null;
   return (
-    <div className="card-wrap"
+    <div style={{ width: '100%', maxWidth: 680, display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+      {/* Suchfeld */}
+      <div style={{ position: 'relative' }}>
+        <input
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder={`${folder.cards.length} Karten durchsuchen…`}
+          style={{
+            width: '100%', fontSize: 15, padding: '11px 40px 11px 16px',
+            border: '1px solid var(--border-2)', borderRadius: 10,
+            background: 'var(--surface)', color: 'var(--text)',
+            fontFamily: 'inherit',
+          }}
+          onFocus={e => { e.target.style.outline = 'none'; e.target.style.borderColor = 'var(--accent)'; e.target.style.boxShadow = '0 0 0 3px var(--accent-soft)'; }}
+          onBlur={e => { e.target.style.borderColor = 'var(--border-2)'; e.target.style.boxShadow = 'none'; }}
+        />
+        {search && (
+          <button onClick={() => setSearch('')} style={{
+            position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)',
+            color: 'var(--text-3)', display: 'flex', alignItems: 'center',
+          }}><X size={15} /></button>
+        )}
+      </div>
+
+      {/* Karten-Liste */}
+      {filtered.length === 0 ? (
+        <div style={{ textAlign: 'center', color: 'var(--text-3)', padding: '3rem 0', fontSize: 14 }}>
+          {search ? 'Keine Karten gefunden.' : 'Noch keine Karten vorhanden.'}
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          {filtered.map((card, i) => (
+            <BrowseCard
+              key={card.id}
+              card={card}
+              index={i}
+              speech={speech}
+              cardRef={el => { cardRefs.current[card.id] = el; }}
+              onEdit={() => handleEdit(card)}
+              onDelete={() => {
+                if (confirm('Diese Karte löschen?')) onDelete(card);
+              }}
+              onImageDrop={onImageDrop}
+            />
+          ))}
+        </div>
+      )}
+
+      {search && filtered.length > 0 && (
+        <div style={{ textAlign: 'center', fontSize: 12, color: 'var(--text-3)', paddingBottom: '1rem' }}>
+          {filtered.length} von {folder.cards.length} Karten
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BrowseCard({ card, index, speech, cardRef, onEdit, onDelete, onImageDrop }) {
+  const [expanded, setExpanded] = useState(false);
+  const imgDrop = useCardImageDrop((base64) => onImageDrop(card.id, base64));
+
+  return (
+    <div
+      ref={cardRef}
       onDragEnter={imgDrop.onDragEnter}
       onDragLeave={imgDrop.onDragLeave}
       onDragOver={imgDrop.onDragOver}
       onDrop={imgDrop.onDrop}
-      style={imgDrop.draggingOver ? { outline: '2px dashed var(--accent)', borderRadius: 'var(--radius)' } : undefined}
+      style={{
+        background: 'var(--surface)',
+        border: `1px solid ${imgDrop.draggingOver ? 'var(--accent)' : 'var(--border)'}`,
+        borderRadius: 12,
+        overflow: 'hidden',
+        boxShadow: '0 2px 8px rgba(76,62,150,.06)',
+        transition: 'border-color .15s',
+      }}
     >
-      <div className="progress"><div className="progress-fill" style={{ width: ((idx + 1) / n * 100) + '%' }} /></div>
-      <CardShell flipped={flipped} onClick={flip}
-        front={<><CatBadge card={card} /><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="term" style={{ flex: 1 }}>{card.term}</div><SpeakButton text={card.term} speech={speech} /></div><CardImage src={card.image} /></>}
-        back={<><div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}><div className="def" style={{ flex: 1 }}>{card.def || '—'}</div><SpeakButton text={card.def} speech={speech} /></div><CardImage src={card.image} /></>} />
-      <p className="hint">{flipped ? 'Klicken für Begriff' : 'Klicken zum Umdrehen · Leertaste'}</p>
-      <div className="nav">
-        <button className="btn sm" onClick={() => go(idx - 1)}><ChevronLeft size={15} />Zurück</button>
-        <span className="counter">{idx + 1} / {n}</span>
-        <button className="btn sm" onClick={() => go(idx + 1)}>Weiter<ChevronRight size={15} /></button>
+      {/* Obere Leiste: Begriff + Aktionen */}
+      <div
+        onClick={() => setExpanded(e => !e)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 12,
+          padding: '14px 16px', cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        <span style={{
+          fontSize: 11, color: 'var(--text-3)', fontFamily: 'DM Mono, monospace',
+          minWidth: 24, textAlign: 'right', flexShrink: 0,
+        }}>{index + 1}</span>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {(card.catLabel || card.cat) && (
+            <span className={'cat ' + catClass(card.cat)} style={{ marginBottom: 4, display: 'inline-block' }}>
+              {card.catLabel || CATS[card.cat]?.label || card.cat}
+            </span>
+          )}
+          <div style={{
+            fontFamily: 'DM Mono, monospace', fontSize: 15, fontWeight: 500,
+            color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          }}>
+            {card.term}
+          </div>
+          {!expanded && card.def && (
+            <div style={{
+              fontSize: 13, color: 'var(--text-3)', marginTop: 2,
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>
+              {card.def}
+            </div>
+          )}
+        </div>
+
+        {/* Aktionen */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}
+          onClick={e => e.stopPropagation()}>
+          <SpeakButton text={card.term} speech={speech} />
+          <button className="ghost xs" onClick={onEdit} title="Bearbeiten">
+            <Pencil size={13} />
+          </button>
+          <button className="ghost xs" onClick={onDelete} title="Löschen"
+            style={{ color: 'var(--text-3)' }}>
+            <Trash2 size={13} />
+          </button>
+          <button style={{
+            display: 'flex', alignItems: 'center', color: 'var(--text-3)',
+            padding: '4px 6px', borderRadius: 6, transition: 'color .1s',
+          }}>
+            <ChevronDown size={15} style={{
+              transform: expanded ? 'rotate(180deg)' : 'none',
+              transition: 'transform .2s',
+            }} />
+          </button>
+        </div>
       </div>
-      <div className="card-tools">
-        <button className="ghost sm" onClick={() => onEdit(card)}><Pencil size={13} />Bearbeiten</button>
-        <button className="ghost sm" onClick={() => onDelete(card)}><Trash2 size={13} />Löschen</button>
-        {card.image
-          ? <button className="ghost sm" onClick={() => onImageDrop(card.id, null)}><X size={13} />Bild entfernen</button>
-          : <span style={{ fontSize: 12, color: 'var(--text-3)', padding: '4px 8px' }}>Bild hierher ziehen</span>
-        }
-      </div>
-      <div className="dots">
-        {order.map((id, i) => (
-          <span key={id} className={'dot-nav' + (i === idx ? ' active' : seen.has(i) ? ' seen' : '')}
-            onClick={() => go(i)} />
-        ))}
-      </div>
+
+      {/* Aufgeklappte Rückseite */}
+      {expanded && (
+        <div style={{
+          borderTop: '1px solid var(--border)',
+          padding: '14px 16px 14px 52px',
+          background: 'var(--surface-2)',
+          animation: 'fadeUp .15s ease',
+        }}>
+          <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '.06em' }}>
+            Rückseite
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+            <div style={{ fontSize: 14, lineHeight: 1.65, whiteSpace: 'pre-wrap', color: 'var(--text)', flex: 1 }}>
+              {card.def || '—'}
+            </div>
+            <SpeakButton text={card.def} speech={speech} />
+          </div>
+          {card.image && <CardImage src={card.image} />}
+          {!card.image && (
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 10 }}>
+              {imgDrop.draggingOver ? '📎 Bild loslassen…' : 'Bild hierher ziehen'}
+            </div>
+          )}
+          {card.image && (
+            <button className="ghost xs" style={{ marginTop: 8, color: 'var(--text-3)' }}
+              onClick={() => onImageDrop(card.id, null)}>
+              <X size={12} />Bild entfernen
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2031,7 +2167,7 @@ export default function App() {
       );
     }
     if (mode === 'browse') return <BrowseView folder={f} order={order}
-      onEdit={(card) => setDialog({ type: 'card', card })}
+      onEdit={(card, onScrollBack) => setDialog({ type: 'card', card, onScrollBack })}
       onDelete={(card) => { if (confirm('Diese Karte löschen?')) { store.deleteCard(f.id, card.id); toast('Karte gelöscht'); } }}
       onImageDrop={(cardId, image) => store.updateCardImage(f.id, cardId, image)} />;
     if (mode === 'learn') return <LearnView folder={f} order={order} onReview={store.reviewCard} />;
@@ -2133,7 +2269,7 @@ export default function App() {
         {dialog?.type === 'card' && activeFolder && (
           <CardDialog initial={dialog.card} onClose={() => setDialog(null)}
             onAdd={(d) => store.addCard(activeFolder.id, d)}
-            onSave={(d) => { store.updateCard(activeFolder.id, dialog.card.id, d); toast('Gespeichert'); }} />
+            onSave={(d) => { store.updateCard(activeFolder.id, dialog.card.id, d); toast('Gespeichert'); dialog.onScrollBack?.(); }} />
         )}
         {dialog?.type === 'settings' && activeFolder && (
           <SettingsDialog folder={activeFolder} onClose={() => setDialog(null)}
